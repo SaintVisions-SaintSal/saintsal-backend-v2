@@ -89,7 +89,16 @@ async function handleGeminiChat(req, res, message, model, stream, history) {
 
   const { GoogleGenerativeAI } = require('@google/generative-ai');
   const genAI = new GoogleGenerativeAI(key);
-  const modelName = (model && model.toLowerCase().includes('gemini')) ? model : 'gemini-2.0-flash';
+  // Map old/generic names to current available models
+  const geminiModelMap = {
+    'gemini-2.0-flash': 'gemini-2.5-flash',
+    'gemini-2.0': 'gemini-2.5-flash',
+    'gemini-flash': 'gemini-2.5-flash',
+    'gemini-pro': 'gemini-2.5-pro',
+    'gemini': 'gemini-2.5-flash',
+  };
+  const rawModel = (model && model.toLowerCase().includes('gemini')) ? model.toLowerCase() : 'gemini';
+  const modelName = geminiModelMap[rawModel] || rawModel.startsWith('gemini-2.5') ? rawModel : 'gemini-2.5-flash';
   const geminiModel = genAI.getGenerativeModel({ model: modelName, systemInstruction: SAL_SYSTEM_PROMPT });
 
   // Build chat history
@@ -259,7 +268,7 @@ app.post('/api/builder/generate', async (req, res) => {
   try {
     const { GoogleGenerativeAI } = require('@google/generative-ai');
     const genAI = new GoogleGenerativeAI(key);
-    const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
 
     const builderPrompt = `You are an expert web developer. Build a complete, beautiful, modern website based on this description:
 
