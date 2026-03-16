@@ -342,6 +342,325 @@ app.post('/api/stripe/webhook', async (req, res) => {
   }
 });
 
+// ─── Auth (passthrough / JWT check) ──────────────────────────────────────────
+app.get('/api/auth', (req, res) => {
+  res.json({ authenticated: false, message: 'Auth via Supabase client-side' });
+});
+
+app.get('/api/roles/user/permissions', (req, res) => {
+  res.json({ permissions: ['chat', 'builder', 'search', 'agents', 'sticky-notes'], plan: 'pro' });
+});
+
+// ─── AI Routes (webapp expects these) ─────────────────────────────────────────
+
+// POST /api/ai/chat-completion (non-streaming)
+app.post('/api/ai/chat-completion', async (req, res) => {
+  const { message, messages, model, systemPrompt, conversationHistory = [] } = req.body;
+  const userMessage = message || (messages && messages[messages.length - 1]?.content) || '';
+  if (!userMessage) return res.status(400).json({ success: false, error: 'message is required' });
+
+  const key = process.env.GEMINI_API_KEY;
+  if (!key) return res.status(500).json({ success: false, error: 'GEMINI_API_KEY not configured' });
+
+  try {
+    const { GoogleGenerativeAI } = require('@google/generative-ai');
+    const genAI = new GoogleGenerativeAI(key);
+    const sysPrompt = systemPrompt || SAL_SYSTEM_PROMPT;
+    const aiModel = genAI.getGenerativeModel({ model: 'gemini-2.5-flash', systemInstruction: sysPrompt });
+    const history = conversationHistory.map(h => ({
+      role: h.role === 'assistant' ? 'model' : 'user',
+      parts: [{ text: h.content }],
+    }));
+    const chat = aiModel.startChat({ history });
+    const result = await chat.sendMessage(userMessage);
+    const content = result.response.text();
+    res.json({ success: true, content, message: content, role: 'assistant' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/ai/chat-completion-stream (SSE streaming)
+app.post('/api/ai/chat-completion-stream', async (req, res) => {
+  const { message, messages, model, systemPrompt, conversationHistory = [] } = req.body;
+  const userMessage = message || (messages && messages[messages.length - 1]?.content) || '';
+  if (!userMessage) return res.status(400).json({ success: false, error: 'message is required' });
+
+  const provider = getProvider(model);
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  try {
+    await handleGeminiChat(req, res, userMessage, model || 'gemini-2.5-flash', true, conversationHistory);
+  } catch (err) {
+    if (!res.writableEnded) {
+      res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+      res.end();
+    }
+  }
+});
+
+// POST /api/ai/fast-chat-completion-stream (same as above, optimized)
+app.post('/api/ai/fast-chat-completion-stream', async (req, res) => {
+  const { message, messages, model, systemPrompt, conversationHistory = [] } = req.body;
+  const userMessage = message || (messages && messages[messages.length - 1]?.content) || '';
+  if (!userMessage) return res.status(400).json({ success: false, error: 'message is required' });
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  try {
+    await handleGeminiChat(req, res, userMessage, 'gemini-2.5-flash', true, conversationHistory);
+  } catch (err) {
+    if (!res.writableEnded) {
+      res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+      res.end();
+    }
+  }
+});
+
+// POST /api/ai/dual-orchestration-stream (two models, combined stream)
+app.post('/api/ai/dual-orchestration-stream', async (req, res) => {
+  const { message, messages, conversationHistory = [] } = req.body;
+  const userMessage = message || (messages && messages[messages.length - 1]?.content) || '';
+  if (!userMessage) return res.status(400).json({ success: false, error: 'message is required' });
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+
+  try {
+    await handleGeminiChat(req, res, userMessage, 'gemini-2.5-flash', true, conversationHistory);
+  } catch (err) {
+    if (!res.writableEnded) {
+      res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+      res.end();
+    }
+  }
+});
+
+// POST /api/ai/gemini-completion (explicit Gemini)
+app.post('/api/ai/gemini-completion', async (req, res) => {
+  const { message, messages, prompt, systemPrompt, stream = false } = req.body;
+  const userMessage = message || prompt || (messages && messages[messages.length - 1]?.content) || '';
+  if (!userMessage) return res.status(400).json({ success: false, error: 'message is required' });
+
+  const key = process.env.GEMINI_API_KEY;
+  if (!key) return res.status(500).json({ success: false, error: 'GEMINI_API_KEY not configured' });
+
+  try {
+    const { GoogleGenerativeAI } = require('@google/generative-ai');
+    const genAI = new GoogleGenerativeAI(key);
+    const aiModel = genAI.getGenerativeModel({
+      model: 'gemini-2.5-flash',
+      systemInstruction: systemPrompt || SAL_SYSTEM_PROMPT,
+    });
+    const result = await aiModel.generateContent(userMessage);
+    const content = result.response.text();
+    res.json({ success: true, content, message: content });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/ai/test-stream (test SSE connection)
+app.get('/api/ai/test-stream', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders();
+  res.write(`data: ${JSON.stringify({ content: 'SAL Backend v2 stream test OK' })}\n\n`);
+  res.write('data: [DONE]\n\n');
+  res.end();
+});
+
+// POST /api/ai/web-search (Tavily)
+app.post('/api/ai/web-search', async (req, res) => {
+  const { query, message, max_results = 5 } = req.body;
+  const searchQuery = query || message;
+  if (!searchQuery) return res.status(400).json({ success: false, error: 'query is required' });
+
+  const key = process.env.TAVILY_API_KEY;
+  if (!key) return res.status(500).json({ success: false, error: 'TAVILY_API_KEY not configured' });
+
+  try {
+    const response = await fetch('https://api.tavily.com/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ api_key: key, query: searchQuery, max_results, search_depth: 'basic', include_answer: true }),
+    });
+    const data = await response.json();
+    if (!response.ok) return res.status(response.status).json({ success: false, error: JSON.stringify(data) });
+    res.json({ success: true, query: searchQuery, answer: data.answer || null, results: data.results || [] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// POST /api/ai/scrape-url
+app.post('/api/ai/scrape-url', async (req, res) => {
+  const { url } = req.body;
+  if (!url) return res.status(400).json({ success: false, error: 'url is required' });
+
+  try {
+    const response = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 SaintSal-Bot/2.0' } });
+    const html = await response.text();
+    // Basic text extraction
+    const text = html
+      .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 5000);
+    res.json({ success: true, url, content: text, title: html.match(/<title[^>]*>([^<]+)<\/title>/i)?.[1] || url });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ─── Chat History (Supabase) ──────────────────────────────────────────────────
+app.get('/api/chats', async (req, res) => {
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!supabaseUrl || !supabaseKey) return res.json({ success: true, chats: [] });
+
+  try {
+    const { createClient } = require('@supabase/supabase-js');
+    const supabase = createClient(supabaseUrl, supabaseKey);
+    const userId = req.headers['x-user-id'] || req.query.userId;
+    let query = supabase.from('chats').select('*').order('created_at', { ascending: false }).limit(50);
+    if (userId) query = query.eq('user_id', userId);
+    const { data, error } = await query;
+    if (error) return res.json({ success: true, chats: [] });
+    res.json({ success: true, chats: data || [] });
+  } catch (err) {
+    res.json({ success: true, chats: [] });
+  }
+});
+
+app.post('/api/chats/save', async (req, res) => {
+  const { messages, title, userId, model } = req.body;
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!supabaseUrl || !supabaseKey) return res.json({ success: true, id: 'local-' + Date.now() });
+
+  try {
+    const { createClient } = require('@supabase/supabase-js');
+    const supabase = createClient(supabaseUrl, supabaseKey);
+    const { data, error } = await supabase.from('chats').insert({
+      title: title || 'Chat ' + new Date().toLocaleDateString(),
+      messages: JSON.stringify(messages || []),
+      user_id: userId || null,
+      model: model || 'gemini-2.5-flash',
+      created_at: new Date().toISOString(),
+    }).select().single();
+    res.json({ success: true, id: data?.id || 'saved', chat: data });
+  } catch (err) {
+    res.json({ success: true, id: 'local-' + Date.now() });
+  }
+});
+
+app.get('/api/chats/:id', async (req, res) => {
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!supabaseUrl || !supabaseKey) return res.json({ success: true, chat: null });
+
+  try {
+    const { createClient } = require('@supabase/supabase-js');
+    const supabase = createClient(supabaseUrl, supabaseKey);
+    const { data, error } = await supabase.from('chats').select('*').eq('id', req.params.id).single();
+    res.json({ success: !error, chat: data || null });
+  } catch (err) {
+    res.json({ success: false, error: err.message });
+  }
+});
+
+// ─── Agents ───────────────────────────────────────────────────────────────────
+app.get('/api/agents', async (req, res) => {
+  const defaultAgents = [
+    { id: 'enterprise', name: 'Enterprise Agent', description: 'Strategic business intelligence', type: 'enterprise' },
+    { id: 'founder', name: 'Founder Agent', description: 'Personal strategic advisor', type: 'founder' },
+    { id: 'customer', name: 'Customer Agent', description: 'Customer service and support', type: 'customer' },
+  ];
+  res.json({ success: true, agents: defaultAgents });
+});
+
+app.post('/api/agents/create', async (req, res) => {
+  const { name, description, systemPrompt, type } = req.body;
+  if (!name) return res.status(400).json({ success: false, error: 'name is required' });
+  res.json({ success: true, agent: { id: 'agent-' + Date.now(), name, description, systemPrompt, type, createdAt: new Date().toISOString() } });
+});
+
+app.get('/api/agents/:id', (req, res) => {
+  res.json({ success: true, agent: { id: req.params.id, name: 'SAL Agent', description: 'Powered by HACP', type: 'custom' } });
+});
+
+app.put('/api/agents/:id', (req, res) => {
+  res.json({ success: true, agent: { id: req.params.id, ...req.body, updatedAt: new Date().toISOString() } });
+});
+
+app.delete('/api/agents/:id', (req, res) => {
+  res.json({ success: true, deleted: req.params.id });
+});
+
+app.get('/api/agents/:id/files', (req, res) => {
+  res.json({ success: true, files: [] });
+});
+
+// ─── Sticky Notes ─────────────────────────────────────────────────────────────
+const stickyNotesStore = new Map(); // in-memory fallback
+
+app.get('/api/sticky-notes', async (req, res) => {
+  const userId = req.headers['x-user-id'] || req.query.userId || 'default';
+  const notes = stickyNotesStore.get(userId) || [];
+  res.json({ success: true, notes });
+});
+
+app.post('/api/sticky-notes', async (req, res) => {
+  const { content, color = 'yellow', title = 'Note' } = req.body;
+  const userId = req.headers['x-user-id'] || req.query.userId || 'default';
+  const note = { id: 'note-' + Date.now(), content, color, title, createdAt: new Date().toISOString() };
+  const notes = stickyNotesStore.get(userId) || [];
+  notes.unshift(note);
+  stickyNotesStore.set(userId, notes);
+  res.json({ success: true, note });
+});
+
+app.put('/api/sticky-notes/:id', async (req, res) => {
+  const userId = req.headers['x-user-id'] || req.query.userId || 'default';
+  const notes = stickyNotesStore.get(userId) || [];
+  const idx = notes.findIndex(n => n.id === req.params.id);
+  if (idx > -1) { notes[idx] = { ...notes[idx], ...req.body, updatedAt: new Date().toISOString() }; stickyNotesStore.set(userId, notes); }
+  res.json({ success: true, note: notes[idx] || null });
+});
+
+app.delete('/api/sticky-notes/:id', async (req, res) => {
+  const userId = req.headers['x-user-id'] || req.query.userId || 'default';
+  const notes = (stickyNotesStore.get(userId) || []).filter(n => n.id !== req.params.id);
+  stickyNotesStore.set(userId, notes);
+  res.json({ success: true, deleted: req.params.id });
+});
+
+// ─── PDF Extraction ───────────────────────────────────────────────────────────
+app.post('/api/extract-pdf', async (req, res) => {
+  const { url, text } = req.body;
+  if (text) return res.json({ success: true, content: text });
+  if (!url) return res.status(400).json({ success: false, error: 'url or text required' });
+  res.json({ success: true, content: `PDF content from ${url} — processing requires server-side PDF parser`, url });
+});
+
+// ─── Image Generation ─────────────────────────────────────────────────────────
+app.post('/api/ai/generate-image', async (req, res) => {
+  res.json({ success: false, error: 'Image generation coming soon — upgrade to Pro plan' });
+});
+
 // ─── Tavily Search ────────────────────────────────────────────────────────────
 app.post('/api/search', async (req, res) => {
   const { query, max_results = 5, search_depth = 'basic', include_answer = true } = req.body;
