@@ -318,6 +318,51 @@ app.get('/api/builder/projects', (req, res) => {
   res.json({ success: true, projects: [] });
 });
 
+// ─── Payments / Stripe Checkout ───────────────────────────────────────────────
+app.post('/api/payments/create-checkout-session', async (req, res) => {
+  const stripeKey = process.env.STRIPE_SECRET_KEY;
+  if (!stripeKey) return res.status(500).json({ success: false, error: 'Stripe not configured' });
+
+  const { priceId, userId, email, successUrl, cancelUrl, plan } = req.body;
+  if (!priceId) return res.status(400).json({ success: false, error: 'priceId is required' });
+
+  try {
+    const stripe = require('stripe')(stripeKey);
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      payment_method_types: ['card'],
+      line_items: [{ price: priceId, quantity: 1 }],
+      success_url: successUrl || `${req.headers.origin || 'https://saintsal-webapp.onrender.com'}/account?success=true&plan=${plan || 'pro'}`,
+      cancel_url: cancelUrl || `${req.headers.origin || 'https://saintsal-webapp.onrender.com'}/pricing?canceled=true`,
+      ...(email && { customer_email: email }),
+      metadata: {
+        userId: userId || '',
+        plan: plan || '',
+      },
+      allow_promotion_codes: true,
+    });
+
+    res.json({ success: true, url: session.url, sessionId: session.id });
+  } catch (err) {
+    console.error('[Stripe Checkout Error]', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.get('/api/payments/plans', (req, res) => {
+  res.json({
+    success: true,
+    plans: [
+      { id: 'free', name: 'Free', price: 0, priceId: null },
+      { id: 'unlimited', name: 'Unlimited', price: 27, priceId: 'price_1T5bkAL47U80vDLAslOm3HoX' },
+      { id: 'pro', name: 'Pro', price: 97, priceId: 'price_1T5bkBL47U80vDLALiVDkOgb' },
+      { id: 'teams', name: 'Teams', price: 297, priceId: 'price_1T5bkCL47U80vDLANsCa647K' },
+      { id: 'enterprise', name: 'Enterprise', price: null, priceId: 'price_1T5bkDL47U80vDLANXWF33A7' },
+    ],
+  });
+});
+
 // ─── Stripe Webhook ───────────────────────────────────────────────────────────
 app.post('/api/stripe/webhook', async (req, res) => {
   const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
