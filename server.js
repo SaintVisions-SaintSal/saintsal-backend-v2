@@ -342,6 +342,104 @@ app.post('/api/stripe/webhook', async (req, res) => {
   }
 });
 
+// ─── Tavily Search ────────────────────────────────────────────────────────────
+app.post('/api/search', async (req, res) => {
+  const { query, max_results = 5, search_depth = 'basic', include_answer = true } = req.body;
+
+  if (!query) return res.status(400).json({ success: false, error: 'query is required' });
+
+  const key = process.env.TAVILY_API_KEY;
+  if (!key) return res.status(500).json({ success: false, error: 'TAVILY_API_KEY not configured' });
+
+  try {
+    const response = await fetch('https://api.tavily.com/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        api_key: key,
+        query,
+        max_results,
+        search_depth,
+        include_answer,
+        include_images: false,
+      }),
+    });
+
+    if (!response.ok) {
+      const err = await response.text();
+      return res.status(response.status).json({ success: false, error: err });
+    }
+
+    const data = await response.json();
+    res.json({
+      success: true,
+      query,
+      answer: data.answer || null,
+      results: data.results || [],
+      response_time: data.response_time,
+    });
+  } catch (err) {
+    console.error('[Tavily Error]', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// SAL Chat with Web Search (Tavily + AI)
+app.post('/api/sal/search-chat', async (req, res) => {
+  const { message, model, stream = false } = req.body;
+  if (!message) return res.status(400).json({ success: false, error: 'message is required' });
+
+  const tavilyKey = process.env.TAVILY_API_KEY;
+  const geminiKey = process.env.GEMINI_API_KEY;
+  if (!tavilyKey) return res.status(500).json({ success: false, error: 'TAVILY_API_KEY not configured' });
+  if (!geminiKey) return res.status(500).json({ success: false, error: 'GEMINI_API_KEY not configured' });
+
+  try {
+    // Step 1: Search the web
+    const searchResp = await fetch('https://api.tavily.com/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        api_key: tavilyKey,
+        query: message,
+        max_results: 5,
+        search_depth: 'basic',
+        include_answer: true,
+      }),
+    });
+    const searchData = await searchResp.json();
+
+    // Step 2: Build context from search results
+    const searchContext = searchData.results
+      ? searchData.results.slice(0, 5).map((r, i) => `[${i+1}] ${r.title}\n${r.content}\nSource: ${r.url}`).join('\n\n')
+      : '';
+    const searchAnswer = searchData.answer || '';
+
+    // Step 3: Ask AI with context
+    const { GoogleGenerativeAI } = require('@google/generative-ai');
+    const genAI = new GoogleGenerativeAI(geminiKey);
+    const aiModel = genAI.getGenerativeModel({
+      model: 'gemini-2.5-flash',
+      systemInstruction: `${SAL_SYSTEM_PROMPT}\n\nYou have access to real-time web search results. Use them to provide accurate, up-to-date answers. Always cite your sources.`,
+    });
+
+    const prompt = `User question: ${message}\n\nWeb search results:\n${searchAnswer ? `Quick answer: ${searchAnswer}\n\n` : ''}${searchContext}\n\nProvide a comprehensive answer based on these search results.`;
+
+    const result = await aiModel.generateContent(prompt);
+    const content = result.response.text();
+
+    res.json({
+      success: true,
+      content,
+      sources: searchData.results ? searchData.results.slice(0, 5).map(r => ({ title: r.title, url: r.url })) : [],
+      searchAnswer,
+    });
+  } catch (err) {
+    console.error('[Search-Chat Error]', err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // ─── 404 Handler ──────────────────────────────────────────────────────────────
 app.use((req, res) => {
   res.status(404).json({ success: false, error: 'Endpoint not found', path: req.path });
