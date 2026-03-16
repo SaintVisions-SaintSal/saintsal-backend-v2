@@ -142,7 +142,16 @@ async function handleAnthropicChat(req, res, message, model, stream, history) {
   const Anthropic = require('@anthropic-ai/sdk');
   const client = new Anthropic.default({ apiKey: key });
 
-  const modelName = (model && model.toLowerCase().includes('claude')) ? model : 'claude-sonnet-4-5';
+  const claudeModelMap = {
+    'claude': 'claude-sonnet-4-5',
+    'claude-3': 'claude-3-5-sonnet-20241022',
+    'claude-sonnet': 'claude-sonnet-4-5',
+    'claude-opus': 'claude-opus-4-5',
+    'claude-haiku': 'claude-haiku-3-5',
+    'anthropic': 'claude-sonnet-4-5',
+  };
+  const rawClaudeModel = model ? model.toLowerCase() : 'claude';
+  const modelName = claudeModelMap[rawClaudeModel] || (rawClaudeModel.startsWith('claude-') && rawClaudeModel.length > 10 ? rawClaudeModel : 'claude-sonnet-4-5');
 
   const messages = [
     ...history.map(h => ({ role: h.role, content: h.content })),
