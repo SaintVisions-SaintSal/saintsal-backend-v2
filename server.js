@@ -19,7 +19,25 @@ app.use((req, res, next) => {
 });
 
 // ─── SAL System Prompt ────────────────────────────────────────────────────────
-const SAL_SYSTEM_PROMPT = `You are SAL — SaintSal™'s intelligent AI assistant, powered by HACP™ (Human AI Connection Protocol) technology, developed by Saint Vision Technologies. You are direct, helpful, knowledgeable, and capable. You assist with business strategy, creativity, research, coding, and anything else users need. Always be concise but thorough. Powered by US Patent #10,290,222.`;
+// Canonical identity + platform knowledge lives in saintsalKnowledgeCore.js.
+// Do not inline identity text here — edit the knowledge core so every surface
+// (backend, web, iOS, voice) stays in sync from one source of truth.
+const { SAINTSAL_KNOWLEDGE_CORE, buildSaintSalSystemPrompt } = require('./saintsalKnowledgeCore');
+
+const SAL_SYSTEM_PROMPT = buildSaintSalSystemPrompt({
+  surfacePersona:
+    'You are answering through the SaintSal API. Be direct, concise, and thorough. ' +
+    'You assist with business strategy, creativity, research, coding, and anything else ' +
+    'the user needs.',
+});
+
+// Clients may pass their own systemPrompt for surface/persona flavor, but they must
+// never be able to strip SAL's identity. Always seat the knowledge core underneath.
+function withKnowledgeCore(clientSystemPrompt) {
+  if (!clientSystemPrompt || !String(clientSystemPrompt).trim()) return SAL_SYSTEM_PROMPT;
+  if (String(clientSystemPrompt).includes('=== WHO YOU ARE ===')) return clientSystemPrompt;
+  return `${SAINTSAL_KNOWLEDGE_CORE}\n\n=== THIS SURFACE ===\n${clientSystemPrompt}`;
+}
 
 // ─── Model Routing ────────────────────────────────────────────────────────────
 function getProvider(model) {
@@ -410,7 +428,7 @@ app.post('/api/ai/chat-completion', async (req, res) => {
   try {
     const { GoogleGenerativeAI } = require('@google/generative-ai');
     const genAI = new GoogleGenerativeAI(key);
-    const sysPrompt = systemPrompt || SAL_SYSTEM_PROMPT;
+    const sysPrompt = withKnowledgeCore(systemPrompt);
     const aiModel = genAI.getGenerativeModel({ model: 'gemini-2.5-flash', systemInstruction: sysPrompt });
     const history = conversationHistory.map(h => ({
       role: h.role === 'assistant' ? 'model' : 'user',
@@ -504,7 +522,7 @@ app.post('/api/ai/gemini-completion', async (req, res) => {
     const genAI = new GoogleGenerativeAI(key);
     const aiModel = genAI.getGenerativeModel({
       model: 'gemini-2.5-flash',
-      systemInstruction: systemPrompt || SAL_SYSTEM_PROMPT,
+      systemInstruction: withKnowledgeCore(systemPrompt),
     });
     const result = await aiModel.generateContent(userMessage);
     const content = result.response.text();
